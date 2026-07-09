@@ -1,0 +1,268 @@
+# imports
+from dynamixel_sdk import *
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import math
+
+# ============================================================
+# Settings
+# ============================================================
+PORT = "/dev/cu.usbserial-FT89FKG7"
+BAUD = 1000000
+
+WRIST_MOTOR1_ID = 11
+WRIST_MOTOR2_ID = 12
+
+TICKS_PER_REV = 4096
+
+WRIST1_ZERO_TICKS = 2059
+WRIST2_ZERO_TICKS = 2056
+
+WRIST2_SIGN = -1   # matches the sign flip you added — flips theta2's visual direction
+
+# Measured hardware limits (degrees, relative to zero — already converted
+# from Wizard's raw readings)
+THETA1_MIN_DEG = -82.98
+THETA1_MAX_DEG = 49.02
+THETA2_MIN_DEG = -112.72
+THETA2_MAX_DEG = 100.28
+
+# ============================================================
+# Wrist geometry
+# ============================================================
+D_INCHES = 8.0
+L_INCHES = 3.0
+Z_OFFSET_INCHES = 0.0   # fill in once calibrated
+
+INCH_TO_METER = 0.0254
+D = D_INCHES * INCH_TO_METER
+L = L_INCHES * INCH_TO_METER
+Z_OFFSET = Z_OFFSET_INCHES * INCH_TO_METER
+
+# How close (in ticks) present position must get to the goal
+# before we call it "arrived" and release torque again
+ARRIVAL_TOLERANCE_TICKS = 15
+
+PRESENT_POSITION_ADDR = 132
+TORQUE_ENABLE_ADDR = 64
+OPERATING_MODE_ADDR = 11
+GOAL_POSITION_ADDR = 116
+
+# ============================================================
+# Open the port
+# ============================================================
+port = PortHandler(PORT)
+packet = PacketHandler(2.0)
+
+if not port.openPort():
+    print("Failed to open port")
+    exit()
+if not port.setBaudRate(BAUD):
+    print("Failed to set baud rate")
+    exit()
+
+# Position Control Mode (3) is fine here — unlike the arm's pan motor,
+# the wrist's range is a limited arc, not a full continuous spin, so
+# there's no risk of the goal ticks landing outside 0-4095.
+for motor_id in (WRIST_MOTOR1_ID, WRIST_MOTOR2_ID):
+    packet.write1ByteTxRx(port, motor_id, TORQUE_ENABLE_ADDR, 0)
+    packet.write1ByteTxRx(port, motor_id, OPERATING_MODE_ADDR, 3)
+
+print("Wrist motors set to Position Control mode, torque off — free to move by hand.")
+
+
+def to_signed32(value):
+    if value >= 2**31:
+        value -= 2**32
+    return value
+
+
+def get_position(dxl_id):
+    raw_position, comm_result, error = packet.read4ByteTxRx(port, dxl_id, PRESENT_POSITION_ADDR)
+    if comm_result != COMM_SUCCESS:
+        print(f"Comm error on ID {dxl_id}: {packet.getTxRxResult(comm_result)}")
+        return None
+    return to_signed32(raw_position)
+
+
+def set_torque(dxl_id, enabled):
+    packet.write1ByteTxRx(port, dxl_id, TORQUE_ENABLE_ADDR, 1 if enabled else 0)
+
+
+def set_goal_position(dxl_id, ticks):
+    packet.write4ByteTxRx(port, dxl_id, GOAL_POSITION_ADDR, int(ticks))
+
+
+def ticks_to_radians(ticks, zero_ticks):
+    return (ticks - zero_ticks) * (2 * math.pi / TICKS_PER_REV)
+
+
+def radians_to_ticks(radians, zero_ticks):
+    return zero_ticks + radians * (TICKS_PER_REV / (2 * math.pi))
+
+
+def wrist_forward_kinematics(theta1, theta2):
+    x = (D + L * math.cos(WRIST2_SIGN * theta2)) * math.cos(theta1)
+    y = L * math.sin(WRIST2_SIGN * theta2)
+    z = Z_OFFSET + (D + L * math.cos(WRIST2_SIGN * theta2)) * math.sin(theta1)
+    return x, y, z
+
+
+# ============================================================
+# Precompute the reachable surface grid — both for drawing AND
+# for click lookup (each surface point has a known theta1, theta2)
+# ============================================================
+STEPS1 = 25
+STEPS2 = 25
+
+theta1_vals = np.linspace(np.radians(THETA1_MIN_DEG), np.radians(THETA1_MAX_DEG), STEPS1)
+theta2_vals = np.linspace(np.radians(THETA2_MIN_DEG), np.radians(THETA2_MAX_DEG), STEPS2)
+
+grid_x_2d = np.zeros((STEPS1, STEPS2))
+grid_y_2d = np.zeros((STEPS1, STEPS2))
+grid_z_2d = np.zeros((STEPS1, STEPS2))
+
+grid_x, grid_y, grid_z = [], [], []
+grid_theta1, grid_theta2 = [], []
+
+for i, t1 in enumerate(theta1_vals):
+    for j, t2 in enumerate(theta2_vals):
+        gx, gy, gz = wrist_forward_kinematics(t1, t2)
+        grid_x_2d[i, j] = gx
+        grid_y_2d[i, j] = gy
+        grid_z_2d[i, j] = gz
+        grid_x.append(gx)
+        grid_y.append(gy)
+        grid_z.append(gz)
+        grid_theta1.append(t1)
+        grid_theta2.append(t2)
+
+grid_x = np.array(grid_x)
+grid_y = np.array(grid_y)
+grid_z = np.array(grid_z)
+grid_theta1 = np.array(grid_theta1)
+grid_theta2 = np.array(grid_theta2)
+
+# ============================================================
+# Set up the plot
+# ============================================================
+fig = plt.figure(figsize=(7, 7))
+ax = fig.add_subplot(111, projection='3d')
+
+ax.plot_wireframe(grid_x_2d, grid_y_2d, grid_z_2d, color='lightgray', alpha=0.4, linewidth=0.5)
+ax.scatter(grid_x, grid_y, grid_z, color='lightblue', s=8, alpha=0.5, picker=5)
+
+point, = ax.plot([0], [0], [Z_OFFSET + D + L], 'ro', markersize=12)
+
+trail_x, trail_y, trail_z = [], [], []
+TRAIL_LENGTH = 50
+trail_line, = ax.plot([], [], [], color='red', alpha=0.3, linewidth=1)
+
+target_marker, = ax.plot([], [], [], 'g^', markersize=14)
+
+position_text = fig.text(0.5, 0.02, "", ha='center', fontsize=11, family='monospace')
+fig.subplots_adjust(bottom=0.12)
+
+ax.set_xlabel('X (m)')
+ax.set_ylabel('Y (m)')
+ax.set_zlabel('Z (m)')
+ax.set_title("Click a point to move the wrist there")
+
+max_reach = D + L
+ax.set_xlim(-max_reach * 1.1, max_reach * 1.1)
+ax.set_ylim(-max_reach * 1.1, max_reach * 1.1)
+ax.set_zlim(Z_OFFSET - max_reach * 1.1, Z_OFFSET + max_reach * 1.1)
+
+# ============================================================
+# State for an in-progress move
+# ============================================================
+current_target = None   # (goal_ticks1, goal_ticks2) while moving, else None
+
+
+def on_pick(event):
+    global current_target
+
+    idx = event.ind[0]
+    theta1_target = grid_theta1[idx]
+    theta2_target = grid_theta2[idx]
+
+    # No shortest-path wraparound needed here — the wrist's range is a
+    # limited arc (not a continuous 360 spin), so a direct absolute
+    # conversion is always safe.
+    goal_ticks1 = radians_to_ticks(theta1_target, WRIST1_ZERO_TICKS)
+    goal_ticks2 = radians_to_ticks(theta2_target, WRIST2_ZERO_TICKS)
+
+    set_torque(WRIST_MOTOR1_ID, True)
+    set_torque(WRIST_MOTOR2_ID, True)
+    set_goal_position(WRIST_MOTOR1_ID, goal_ticks1)
+    set_goal_position(WRIST_MOTOR2_ID, goal_ticks2)
+
+    current_target = (goal_ticks1, goal_ticks2)
+
+    tx, ty, tz = grid_x[idx], grid_y[idx], grid_z[idx]
+    target_marker.set_data([tx], [ty])
+    target_marker.set_3d_properties([tz])
+
+    print(f"Moving wrist to clicked point: theta1={math.degrees(theta1_target):.1f} deg, "
+          f"theta2={math.degrees(theta2_target):.1f} deg")
+
+
+fig.canvas.mpl_connect('pick_event', on_pick)
+
+
+def update(frame):
+    global current_target
+
+    raw1 = get_position(WRIST_MOTOR1_ID)
+    raw2 = get_position(WRIST_MOTOR2_ID)
+
+    if raw1 is None or raw2 is None:
+        return point, trail_line, position_text
+
+    theta1 = ticks_to_radians(raw1, WRIST1_ZERO_TICKS)
+    theta2 = ticks_to_radians(raw2, WRIST2_ZERO_TICKS)
+    x, y, z = wrist_forward_kinematics(theta1, theta2)
+
+    point.set_data([x], [y])
+    point.set_3d_properties([z])
+
+    trail_x.append(x)
+    trail_y.append(y)
+    trail_z.append(z)
+    if len(trail_x) > TRAIL_LENGTH:
+        trail_x.pop(0)
+        trail_y.pop(0)
+        trail_z.pop(0)
+    trail_line.set_data(trail_x, trail_y)
+    trail_line.set_3d_properties(trail_z)
+
+    status = "free move (torque off)"
+
+    if current_target is not None:
+        goal1, goal2 = current_target
+        close_enough = (abs(raw1 - goal1) < ARRIVAL_TOLERANCE_TICKS and
+                         abs(raw2 - goal2) < ARRIVAL_TOLERANCE_TICKS)
+        if close_enough:
+            set_torque(WRIST_MOTOR1_ID, False)
+            set_torque(WRIST_MOTOR2_ID, False)
+            current_target = None
+            target_marker.set_data([], [])
+            target_marker.set_3d_properties([])
+            print("Arrived — torque released, free to move by hand again.")
+        else:
+            status = "moving to clicked target..."
+
+    position_text.set_text(f"x = {x:+.4f} m   y = {y:+.4f} m   z = {z:+.4f} m   [{status}]")
+
+    return point, trail_line, position_text, target_marker
+
+
+ani = FuncAnimation(fig, update, interval=100, blit=False)
+
+try:
+    plt.show()
+finally:
+    set_torque(WRIST_MOTOR1_ID, False)
+    set_torque(WRIST_MOTOR2_ID, False)
+    port.closePort()
