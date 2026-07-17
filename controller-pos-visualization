@@ -123,7 +123,7 @@ class OptiSample: # dataclass that has position, orientation, frames, and time s
     qw: float | None
 
 
-class OptiTrackReceiver: # finds the correct rigid body and saves its most recent position and orientation, not actually estimating where the position and orientation is 
+class OptiTrackReceiver: # reading and saving controller's most recent position and orientation, not actually estimating where the position and orientation is 
     def __init__(self, server_ip: str, client_ip: str, rigid_id: int, data_port: int, command_port: int, use_multicast: bool):
         self.rigid_id = rigid_id
         self.lock = threading.Lock()
@@ -177,7 +177,7 @@ class OptiTrackReceiver: # finds the correct rigid body and saves its most recen
     def stop(self):
         self.client.shutdown()
 
-
+# following quat calculations are for prism rotation
 def quat_normalize(q: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
     norm = math.sqrt(sum(v * v for v in q))
     if norm <= 0.0:
@@ -396,14 +396,14 @@ def main() -> int:
             f"quat=({quat[0]:.4f},{quat[1]:.4f},{quat[2]:.4f},{quat[3]:.4f})"
         )
 
-    def set_gripper_status(new_status: str):
+    def set_gripper_status(new_status: str): # based on if seen is true or false, deciding whether to change the status of the gripper 
         if not tracking_state["enabled"]:
             print(f"Gripper command ignored while tracking is OFF: requested {new_status}.")
             return
         gripper_state["status"] = new_status
         print(f"Gripper status set to {new_status}.")
 
-    def reset_pose_from_latest():
+    def reset_pose_from_latest():  # based on whether seen = true or false, seeing if resetting position and orientation is valid
         if not tracking_state["enabled"]:
             print("Reset ignored while tracking is OFF.")
             return
@@ -481,6 +481,13 @@ def main() -> int:
     fig.canvas.mpl_connect("key_press_event", on_key_press)
     fig.canvas.mpl_connect("close_event", on_close)
 
+# update() is the loop that repeatedly checks whether the latest sample is usable, usually meaning:
+     # - tracking is enabled
+     # - the sample exists
+     #  - the sample is fresh
+     # - seen is not false
+# Then update() computes the relative pose and updates the prism display.
+# flow: 1) optitrackreciever gets the raw data -> 2) update updates that data into prism motion -> 3) transformed_faces draws the actual prism
     def update(_frame_index):
         nonlocal last_status_print
         now = time.monotonic()
