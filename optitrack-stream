@@ -61,6 +61,7 @@ POSITION_SCALE_STEP = 0.1
 MIN_POSITION_SCALE = 0.1
 ORIENTATION_SCALE_STEP = 0.1
 MIN_ORIENTATION_SCALE = 0.1
+DOUBLE_R_WINDOW_S = 0.4
 
 STOP = False
 
@@ -313,7 +314,7 @@ def main() -> int:
     client_ip = CLIENT_IP or local_ip_for_server(SERVER_IP)
     print(f"Streaming rigid body ID {RIGID_ID}")
     print(f"OptiTrack server/client: {SERVER_IP} / {client_ip}")
-    print("Controls: space toggles tracking, o/c set gripper open/closed while tracking is ON, r resets prism position and orientation to the origin while tracking is ON, Up/Down adjust translation scale by 0.1, Left/Right adjust orientation scale by 0.1.")
+    print("Controls: space toggles tracking, o/c set gripper open/closed while tracking is ON, r resets prism position and orientation to the origin while tracking is ON, double-tap r quickly to reset translation and orientation scales to 1.0x, Up/Down adjust translation scale by 0.1, Left/Right adjust orientation scale by 0.1.")
 
     receiver = OptiTrackReceiver(SERVER_IP, client_ip, RIGID_ID, DATA_PORT, COMMAND_PORT, USE_MULTICAST)
     tracking_state = {
@@ -332,6 +333,7 @@ def main() -> int:
     gripper_state = {"status": "open"}
     position_scale = {"value": 1.0}
     orientation_scale = {"value": 1.0}
+    r_key_state = {"last_press_time": None}
     last_status_print = 0.0
     body_vertices = prism_vertices(PRISM_SIZE_M)
 
@@ -441,6 +443,11 @@ def main() -> int:
         orientation_scale["value"] = round(next_scale, 10)
         print(f"Orientation scale set to {orientation_scale['value']:.1f}x.")
 
+    def reset_scales_to_default():
+        position_scale["value"] = 1.0
+        orientation_scale["value"] = 1.0
+        print("Translation and orientation scales reset to 1.0x via double-tap r.")
+
     def on_key_press(event):
         if event.key == " ":
             toggle_tracking_from_latest()
@@ -449,7 +456,15 @@ def main() -> int:
         elif event.key == "c":
             set_gripper_status("closed")
         elif event.key == "r":
+            now = time.monotonic()
+            is_double_tap = (
+                r_key_state["last_press_time"] is not None
+                and (now - r_key_state["last_press_time"]) <= DOUBLE_R_WINDOW_S
+            )
+            r_key_state["last_press_time"] = None if is_double_tap else now
             reset_pose_from_latest()
+            if is_double_tap:
+                reset_scales_to_default()
         elif event.key == "up":
             adjust_position_scale(POSITION_SCALE_STEP)
         elif event.key == "down":
