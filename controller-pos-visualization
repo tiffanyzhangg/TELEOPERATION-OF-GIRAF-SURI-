@@ -17,7 +17,7 @@ from pathlib import Path
 os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplconfig"))
 
 import matplotlib
-from natnet import NatNetClient, Version
+from natnet import NatNetClient, Version #natnet is a software that allows u to livestream motion capture data
 from natnet.packet_buffer import PacketBuffer
 
 
@@ -66,12 +66,12 @@ DOUBLE_R_WINDOW_S = 0.4
 STOP = False
 
 
-def patch_natnet_string_decoder() -> None:
+def patch_natnet_string_decoder() -> None: # replaces natnet's normal string reader with another one that allows non UTF-8 strings 
     original = PacketBuffer.read_string
     if getattr(original, "_bota_optitrack_patched", False):
         return
 
-    def read_string_lossy(self, max_length=None, static_length=False):
+    def read_string_lossy(self, max_length=None, static_length=False): # actually implementing the new read string (making the strings safe)
         if max_length is None:
             data_slice = self._PacketBuffer__data[self.pointer :]
         else:
@@ -92,13 +92,13 @@ def patch_natnet_string_decoder() -> None:
 patch_natnet_string_decoder()
 
 
-def on_signal(_signum, _frame):
+def on_signal(_signum, _frame): # handling termination like ctrl c 
     global STOP
     STOP = True
     plt.close("all")
 
 
-def local_ip_for_server(server_ip: str) -> str:
+def local_ip_for_server(server_ip: str) -> str: #getting correct ip
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect((server_ip, COMMAND_PORT))
@@ -108,7 +108,7 @@ def local_ip_for_server(server_ip: str) -> str:
 
 
 @dataclass
-class OptiSample:
+class OptiSample: # dataclass that has position, orientation, frames, and time stamps 
     local_ns: int
     frame: int | None
     motive_timestamp: float | None
@@ -123,7 +123,7 @@ class OptiSample:
     qw: float | None
 
 
-class OptiTrackReceiver:
+class OptiTrackReceiver: # finds the correct rigid body and saves its most recent position and orientation, not actually estimating where the position and orientation is 
     def __init__(self, server_ip: str, client_ip: str, rigid_id: int, data_port: int, command_port: int, use_multicast: bool):
         self.rigid_id = rigid_id
         self.lock = threading.Lock()
@@ -246,13 +246,13 @@ def mat_vec_mul(matrix, vec: tuple[float, float, float]) -> tuple[float, float, 
     )
 
 
-def sample_pose(sample: OptiSample) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+def sample_pose(sample: OptiSample) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:  # takes an optitrack sample and returns position and quaternion
     if None in (sample.px, sample.py, sample.pz, sample.qx, sample.qy, sample.qz, sample.qw):
         raise ValueError("OptiTrack sample does not contain a full pose")
     return (sample.px, sample.py, sample.pz), quat_normalize((sample.qx, sample.qy, sample.qz, sample.qw))
 
 
-def fresh_sample(receiver: OptiTrackReceiver, max_age_ms: float) -> tuple[OptiSample, float] | None:
+def fresh_sample(receiver: OptiTrackReceiver, max_age_ms: float) -> tuple[OptiSample, float] | None: # checks whether latest sample enough is recent enough to trust
     now_ns = time.monotonic_ns()
     sample = receiver.latest()
     if sample is None or sample.px is None:
@@ -277,7 +277,7 @@ def prism_vertices(size: tuple[float, float, float]) -> list[tuple[float, float,
     ]
 
 
-def transformed_faces(center: tuple[float, float, float], quat: tuple[float, float, float, float], body_vertices: list[tuple[float, float, float]]) -> list[list[tuple[float, float, float]]]:
+def transformed_faces(center: tuple[float, float, float], quat: tuple[float, float, float, float], body_vertices: list[tuple[float, float, float]]) -> list[list[tuple[float, float, float]]]: # draws rectangular prisms position based on its vertices
     rotation = quat_to_matrix(quat)
     transformed = []
     for vertex in body_vertices:
@@ -448,7 +448,7 @@ def main() -> int:
         orientation_scale["value"] = 1.0
         print("Translation and orientation scales reset to 1.0x via double-tap r.")
 
-    def on_key_press(event):
+    def on_key_press(event): # all keyboard commands (o, c, r, up, down, left, right)
         if event.key == " ":
             toggle_tracking_from_latest()
         elif event.key == "o":
