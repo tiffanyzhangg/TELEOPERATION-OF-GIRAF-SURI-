@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Discrete keyboard jogs for the three MD80 GIRAF arm motors only.
+
+The Dynamixel wrist is never imported or commanded. This commissioning script
+assumes the MD80 arm starts at its known home pose before ``motor_connect``
+zeros the encoders.
+
+A/D: counter-clockwise/clockwise base roll
+W/S: extend/retract boom
+Space: latch stop, disable the MD80 motors, and exit
+Q: hold the current target, disable the MD80 motors, and exit
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import select
+import sys
+import termios
+import time
+import tty
+
+import rospy
+
+from anymal_custom_control.motor_driver import (
+    motor_connect,
+    motor_disconnect,
+    motor_drive,
+)
+
+
+ROLL_MIN = -math.pi / 2.0
+ROLL_MAX = math.pi / 2.0
+BOOM_RETRACTED = 0.0
+BOOM_EXTENDED = -30.0
+
+
+class RawTerminal:
+    def __enter__(self):
+        if not sys.stdin.isatty():
+            raise RuntimeError("An interactive terminal is required")
+        self.fd = sys.stdin.fileno()
+        self.settings = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.settings)
+
+    @staticmethod
+    def read_key(timeout: float = 0.1) -> str | None:
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not readable:
+            return None
+        return sys.stdin.read(1)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--roll-step", type=float, default=0.01)
+    parser.add_argument("--boom-step", type=float, default=0.05)
+    parser.add_argument("--settle-seconds", type=float, default=0.15)
+    parser.add_argument("--kp", type=float, default=100.0)
+    parser.add_argument("--kd", type=float, default=5.0)
+    parser.add_argument("--max-torque", type=float, default=6.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    positive_values = (
+        args.roll_step,
+        args.boom_step,
+        args.settle_seconds,
+        args.kp,
+        args.kd,
+        args.max_torque,
+    )
+    if not all(math.isfinite(value) and value > 0 for value in positive_values):
+        raise ValueError("steps, settle time, gains, and torque must be positive")
+
+    rospy.init_node("giraf_arm_keyboard_joint_jog", anonymous=False)
+    roll = 0.0
+    pitch = 0.0
+    boom = BOOM_RETRACTED
+    motor_context = None
+
+    print("ARM-ONLY MD80 KEYBOARD JOG")
+    print("Confirm the three MD80 joints are at their known home pose.")
+    print("The Dynamixel wrist and gripper will not be opened or commanded.")
+    print("A/D: CCW/CW | W/S: extend/retract")
+    print("SPACE: latched stop and exit | Q: clean exit")
+
+    try:
+        motor_context = motor_connect(
+            kp=args.kp,
+            kd=args.kd,
+            max_torque=args.max_torque,
+            gain_overrides={},
+        )
+        motor_drive(motor_context, roll, pitch, boom)
+        print("MD80 motors enabled at home targets; ready for one-key jogs.")
+
+        with RawTerminal() as terminal:
+            while not rospy.is_shutdown():
+                key = terminal.read_key()
+                if key is None:
+                    continue
+                if key == " ":
+                    print("\r\nSTOP LATCHED; disabling MD80 motors.")
+                    return 2
+                if key.lower() == "q":
+                    print("\r\nQuit requested; disabling MD80 motors.")
+                    return 0
+
+                action = None
+                character = key.lower()
+                if character == "a":
+                    roll = min(ROLL_MAX, roll + args.roll_step)
+                    action = "counter-clockwise"
+                elif character == "d":
+                    roll = max(ROLL_MIN, roll - args.roll_step)
+                    action = "clockwise"
+                elif character == "w":
+                    boom = max(BOOM_EXTENDED, boom - args.boom_step)
+                    action = "extend"
+                elif character == "s":
+                    boom = min(BOOM_RETRACTED, boom + args.boom_step)
+                    action = "retract"
+                if action is None:
+                    continue
+
+                motor_drive(motor_context, roll, pitch, boom)
+                print(
+                    f"\r\n{action}: roll={roll:+.3f}, "
+                    f"pitch={pitch:+.3f}, boom={boom:+.3f} rad"
+                )
+                time.sleep(args.settle_seconds)
+        return 0
+    except rospy.ROSInterruptException:
+        return 0
+    finally:
+        if motor_context is not None:
+            motor_drive(motor_context, roll, pitch, boom)
+            time.sleep(0.02)
+            if not motor_disconnect():
+                print("WARNING: not every MD80 acknowledged disable", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
