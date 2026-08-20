@@ -3,7 +3,7 @@
 
 Runs only inside anymal_custom_control. It never opens NatNet or the pedal.
 Fresh, engaged ROS commands are mapped through the physical 6x6 Jacobian to
-the three MD80 arm joints and Dynamixel wrist IDs 21-23. ID 24 stays closed.
+the three MD80 arm joints and Dynamixel wrist IDs 21-23. ID 24 homes open.
 """
 
 import argparse
@@ -16,7 +16,7 @@ import numpy as np
 import rospy
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Empty, String
 
 from anymal_custom_control.RRP_kinematic_model import (
     get_boom_length_d3,
@@ -63,19 +63,27 @@ from anymal_custom_control.motor_driver import (
 POSE_TOPIC = "/giraf_final/relative_pose_cmd"
 ENGAGED_TOPIC = "/giraf_final/engaged"
 GRIPPER_TOPIC = "/giraf_final/gripper_open"
+HOME_TOPIC = "/giraf_final/dynamixel_home"
 STATUS_TOPIC = "/giraf_final/hardware_status"
 MD80_STATE_TOPIC = "/md80/joint_states"
 
 CONTROL_HZ = 100.0
 COMMAND_TIMEOUT_SEC = 0.15
 MD80_TIMEOUT_SEC = 0.30
-POSITION_GAIN = 1.0
-ROTATION_GAIN = 1.0
-LINEAR_LIMIT = np.array((0.05, 0.05, 0.025), dtype=float)
-ANGULAR_LIMIT = np.array((0.125, 0.125, 0.125), dtype=float)
+POSITION_GAIN = 4.5
+ROTATION_GAIN = 4.5
+LINEAR_LIMIT = np.array((0.20, 0.20, 0.10), dtype=float)
+ANGULAR_LIMIT = np.array((0.50, 0.50, 0.50), dtype=float)
 LINEAR_DEADBAND = 0.002
 ANGULAR_DEADBAND = 0.01
-MAX_JOINT_SPEED = np.array((0.10, 0.10, 0.025, 0.15, 0.15, 0.15))
+MAX_JOINT_SPEED = np.array((0.80, 0.80, 0.20, 1.20, 1.20, 1.20))
+
+# Observed OptiTrack orientation mapping: X->Y, Y->Z, Z->X. Conjugating
+# relative rotations by the inverse basis mapping restores X->X, Y->Y, Z->Z.
+OPTITRACK_ROTATION_TO_ROBOT = np.array(
+    ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    dtype=float,
+)
 JACOBIAN_RCOND = 1e-3
 
 
@@ -166,8 +174,8 @@ def validate_dynamixel_configuration(context):
     expected_home = {21: 3075, 22: 3075, 23: 2050}
     if (
         dict(ARM_HOME) != expected_home
-        or GRIPPER_CLOSED[24] != 3900
-        or GRIPPER_OPEN[24] != 6000
+        or GRIPPER_CLOSED[24] != -200
+        or GRIPPER_OPEN[24] != 2200
     ):
         raise RuntimeError("Dynamixel home/gripper calibration does not match final setup")
     state = dynamixel_read(context)
@@ -185,7 +193,8 @@ class Inputs:
     def __init__(self):
         self.lock = threading.Lock()
         self.engaged = False
-        self.gripper_open = False
+        self.gripper_open = True
+        self.home_requests = 0
         self.position = np.zeros(3, dtype=float)
         self.quaternion = np.array((0.0, 0.0, 0.0, 1.0), dtype=float)
         self.pose_receipt = 0.0
@@ -198,6 +207,11 @@ class Inputs:
     def gripper_cb(self, message):
         with self.lock:
             self.gripper_open = bool(message.data)
+
+    def home_cb(self, _message):
+        with self.lock:
+            self.gripper_open = True
+            self.home_requests += 1
 
     def pose_cb(self, message):
         position = np.array(
@@ -237,6 +251,7 @@ class Inputs:
             return (
                 self.engaged,
                 self.gripper_open,
+                self.home_requests,
                 self.position.copy(),
                 self.quaternion.copy(),
                 self.pose_receipt,
@@ -251,6 +266,7 @@ def parse_args():
     parser.add_argument("--kp", type=float, default=100.0)
     parser.add_argument("--kd", type=float, default=5.0)
     parser.add_argument("--max-torque", type=float, default=12.0)
+    parser.add_argument("--dynamixel-home-seconds", type=float, default=3.0)
     return parser.parse_args()
 
 
@@ -258,7 +274,7 @@ def main():
     args = parse_args()
     if not all(
         math.isfinite(value) and value > 0.0
-        for value in (args.kp, args.kd, args.max_torque)
+        for value in (args.kp, args.kd, args.max_torque, args.dynamixel_home_seconds)
     ) or args.dxl_baud <= 0:
         raise ValueError("gains, torque, and baud must be positive")
 
@@ -268,6 +284,7 @@ def main():
     rospy.Subscriber(
         GRIPPER_TOPIC, Bool, inputs.gripper_cb, queue_size=1, tcp_nodelay=True
     )
+    rospy.Subscriber(HOME_TOPIC, Empty, inputs.home_cb, queue_size=1, tcp_nodelay=True)
     rospy.Subscriber(POSE_TOPIC, PoseStamped, inputs.pose_cb, queue_size=1, tcp_nodelay=True)
     rospy.Subscriber(
         MD80_STATE_TOPIC, JointState, inputs.md80_cb, queue_size=2, tcp_nodelay=True
@@ -284,6 +301,12 @@ def main():
     motor_context = None
     dxl_context = None
     tracking = False
+    homing = False
+    homing_started = 0.0
+    homing_start_ticks = None
+    homing_progress = 0.0
+    handled_home_requests = 0
+    home_targets = np.array([ARM_HOME[motor_id] for motor_id in ARM_IDS] + [GRIPPER_OPEN[GRIPPER_IDS[0]]], dtype=float)
     armed_by_release = False
     robot_anchor_position = None
     robot_anchor_rotation = None
@@ -298,10 +321,10 @@ def main():
         dxl_context = dynamixel_connect(port=args.dxl_port, baudrate=args.dxl_baud)
         validate_dynamixel_configuration(dxl_context)
         initial_dxl_targets = [ARM_HOME[motor_id] for motor_id in ARM_IDS] + [
-            GRIPPER_CLOSED[GRIPPER_IDS[0]]
+            GRIPPER_OPEN[GRIPPER_IDS[0]]
         ]
         if not dynamixel_drive(dxl_context, initial_dxl_targets):
-            raise RuntimeError("failed to command wrist home and gripper closed")
+            raise RuntimeError("failed to command wrist home and gripper open")
 
         motor_context = motor_connect(
             kp=args.kp,
@@ -316,13 +339,45 @@ def main():
             now = time.monotonic()
             dt = min(max(now - last_loop, 0.0), 0.02)
             last_loop = now
-            engaged, gripper_open, relative_position, relative_quaternion, pose_time, md80_time = (
-                inputs.snapshot()
-            )
+            (
+                engaged,
+                gripper_open,
+                home_requests,
+                relative_position,
+                relative_quaternion,
+                pose_time,
+                md80_time,
+            ) = inputs.snapshot()
             pose_fresh = pose_time > 0.0 and now - pose_time <= COMMAND_TIMEOUT_SEC
             md80_fresh = md80_time > 0.0 and now - md80_time <= MD80_TIMEOUT_SEC
 
-            if not engaged:
+            if home_requests != handled_home_requests:
+                measured = dynamixel_read(dxl_context)
+                positions = []
+                for motor_id in tuple(ARM_IDS) + tuple(GRIPPER_IDS):
+                    value = measured.get(motor_id, {}).get("position")
+                    if value is None:
+                        raise RuntimeError("cannot home: no position from ID %d" % motor_id)
+                    positions.append(value)
+                homing_start_ticks = np.asarray(positions, dtype=float)
+                homing_started = now
+                homing_progress = 0.0
+                homing = True
+                handled_home_requests = home_requests
+                tracking = False
+                armed_by_release = False
+                robot_anchor_position = None
+                robot_anchor_rotation = None
+                print(
+                    "\nGoing back to home over %.1f seconds: %s"
+                    % (args.dynamixel_home_seconds, home_targets.astype(int).tolist())
+                )
+
+            if homing:
+                tracking = False
+                robot_anchor_position = None
+                robot_anchor_rotation = None
+            elif not engaged:
                 tracking = False
                 armed_by_release = True
                 robot_anchor_position = None
@@ -344,9 +399,13 @@ def main():
             qdot = np.zeros(6, dtype=float)
             if tracking:
                 target_position = robot_anchor_position + relative_position
-                target_rotation = robot_anchor_rotation @ quaternion_to_matrix(
-                    relative_quaternion
+                controller_rotation = quaternion_to_matrix(relative_quaternion)
+                corrected_rotation = (
+                    OPTITRACK_ROTATION_TO_ROBOT.T
+                    @ controller_rotation
+                    @ OPTITRACK_ROTATION_TO_ROBOT
                 )
+                target_rotation = robot_anchor_rotation @ corrected_rotation
                 current_position, current_rotation = end_effector_pose(
                     roll, pitch, d3, wrist
                 )
@@ -392,23 +451,39 @@ def main():
                 wrist = proposed_wrist
 
             motor_drive(motor_context, roll, pitch, boom)
-            gripper_target = (
-                GRIPPER_OPEN[GRIPPER_IDS[0]]
-                if gripper_open
-                else GRIPPER_CLOSED[GRIPPER_IDS[0]]
-            )
-            dxl_targets = wrist_ticks(wrist) + [gripper_target]
+            if homing:
+                raw_progress = (now - homing_started) / args.dynamixel_home_seconds
+                homing_progress = float(np.clip(raw_progress, 0.0, 1.0))
+                blend = homing_progress**2 * (3.0 - 2.0*homing_progress)
+                dxl_targets = np.rint(
+                    homing_start_ticks + blend*(home_targets - homing_start_ticks)
+                ).astype(int).tolist()
+            else:
+                gripper_target = (
+                    GRIPPER_OPEN[GRIPPER_IDS[0]]
+                    if gripper_open
+                    else GRIPPER_CLOSED[GRIPPER_IDS[0]]
+                )
+                dxl_targets = wrist_ticks(wrist) + [gripper_target]
             if not dynamixel_drive(dxl_context, dxl_targets):
                 raise RuntimeError("Dynamixel command transmission failed")
+            if homing and homing_progress >= 1.0:
+                homing = False
+                wrist = np.zeros(3, dtype=float)
+                gripper_open = True
+                armed_by_release = False
+                print("\nDynamixels are back at home. Release and press pedal to resume.")
 
             if now - last_status >= 0.25:
                 last_status = now
                 status = (
-                    "tracking=%s engaged=%s pose_fresh=%s md80_fresh=%s "
+                    "tracking=%s engaged=%s homing=%s home=%.0f%% pose_fresh=%s md80_fresh=%s "
                     "|v|=%.4f |w|=%.4f |qdot|=%.4f"
                     % (
                         tracking,
                         engaged,
+                        homing,
+                        100.0*homing_progress,
                         pose_fresh,
                         md80_fresh,
                         np.linalg.norm(linear_velocity),
