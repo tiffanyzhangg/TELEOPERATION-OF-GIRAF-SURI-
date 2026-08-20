@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Operator-side OptiTrack/pedal publisher for final GIRAF teleoperation.
+
+Runs only in the giraf-teleop container. It never imports or opens robot motor
+interfaces. Hold the foot pedal to publish controller motion relative to the
+fresh pose captured on that pedal press; release publishes engaged=False.
+"""
+
+import argparse
+import math
+import select
+import signal
+import sys
+import termios
+import threading
+import time
+import tty
+
+import numpy as np
+import rospy
+from evdev import InputDevice, ecodes
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Bool, String
+
+from giraf_optitrak_teleop.deadman import SpaceDeadmanReader
+from giraf_optitrak_teleop.geometry import (
+    quaternion_conjugate,
+    quaternion_multiply,
+)
+from giraf_optitrak_teleop.natnet_receiver import (
+    OptiTrackReceiver,
+    local_ip_for_server,
+)
+
+
+POSE_TOPIC = "/giraf_final/relative_pose_cmd"
+ENGAGED_TOPIC = "/giraf_final/engaged"
+GRIPPER_TOPIC = "/giraf_final/gripper_open"
+STATUS_TOPIC = "/giraf_final/operator_status"
+
+
+class ShiftToggleReader:
+    """Count physical left/right Shift key-down edges without key-repeat toggles."""
+
+    def __init__(self, device_path):
+        self.device_path = device_path
+        self.lock = threading.Lock()
+        self.press_count = 0
+        self.device_ok = False
+        self.error = "keyboard has not been opened"
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.device = None
+
+    def start(self):
+        device = InputDevice(self.device_path)
+        with self.lock:
+            self.device = device
+            self.device_ok = True
+            self.error = ""
+        self.thread = threading.Thread(
+            target=self._run,
+            name="giraf-shift-scale-toggle",
+            daemon=True,
+        )
+        self.thread.start()
+        return "%s (%s)" % (device.name, self.device_path)
+
+    def _run(self):
+        try:
+            for event in self.device.read_loop():
+                if self.stop_event.is_set():
+                    break
+                if (
+                    event.type == ecodes.EV_KEY
+                    and event.code in (ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT)
+                    and event.value == 1
+                ):
+                    with self.lock:
+                        self.press_count += 1
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                with self.lock:
+                    self.device_ok = False
+                    self.error = "scale-keyboard read failed: %s" % exc
+
+    def snapshot(self):
+        with self.lock:
+            return self.press_count, self.device_ok, self.error
+
+    def stop(self):
+        self.stop_event.set()
+        if self.device is not None:
+            try:
+                self.device.close()
+            except Exception:
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server-ip", default="172.24.68.77")
+    parser.add_argument("--client-ip", default="")
+    parser.add_argument("--rigid-id", type=int, default=40)
+    parser.add_argument("--pedal", default="/dev/input/deadman_keyboard")
+    parser.add_argument("--scale-keyboard", default="/dev/input/scale_keyboard")
+    parser.add_argument("--publish-hz", type=float, default=100.0)
+    parser.add_argument("--timeout-ms", type=float, default=100.0)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.publish_hz <= 0.0 or args.timeout_ms <= 0.0:
+        raise ValueError("publish rate and timeout must be positive")
+
+    rospy.init_node("giraf_final_optitrak_controller", anonymous=False)
+    client_ip = args.client_ip or local_ip_for_server(args.server_ip, 1510)
+    receiver = OptiTrackReceiver(args.server_ip, client_ip, args.rigid_id)
+    deadman = SpaceDeadmanReader(args.pedal)
+    scale_reader = ShiftToggleReader(args.scale_keyboard)
+    pose_pub = rospy.Publisher(POSE_TOPIC, PoseStamped, queue_size=1, tcp_nodelay=True)
+    engaged_pub = rospy.Publisher(
+        ENGAGED_TOPIC, Bool, queue_size=1, latch=True, tcp_nodelay=True
+    )
+    gripper_pub = rospy.Publisher(
+        GRIPPER_TOPIC, Bool, queue_size=1, latch=True, tcp_nodelay=True
+    )
+    status_pub = rospy.Publisher(STATUS_TOPIC, String, queue_size=1, latch=True)
+
+    stop = False
+
+    def request_stop(_signum=None, _frame=None):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    engaged = False
+    armed_by_release = False
+    anchor_pose = None
+    anchor_quaternion = None
+    scale_anchor_controller = None
+    scale_anchor_command = None
+    position_scale = 1.0
+    handled_shift_presses = 0
+    receiver_started = False
+    deadman_started = False
+    scale_reader_started = False
+    gripper_open = False
+    keyboard_fd = None
+    terminal_settings = None
+    last_status = -math.inf
+
+    try:
+        print("Foot pedal: %s" % deadman.start())
+        deadman_started = True
+        print("Position-scale keyboard: %s" % scale_reader.start())
+        scale_reader_started = True
+        print("Press either Shift key to toggle position scale 1.0x/3.0x.")
+        print("OptiTrack: %s" % receiver.start())
+        receiver_started = True
+        print("FINAL OPERATOR: rigid ID %d; hold pedal to track" % args.rigid_id)
+        if sys.stdin.isatty():
+            keyboard_fd = sys.stdin.fileno()
+            terminal_settings = termios.tcgetattr(keyboard_fd)
+            tty.setcbreak(keyboard_fd)
+            print("Press B to toggle the gripper open/closed.")
+        else:
+            print("WARNING: stdin is not a TTY; B-key gripper control is unavailable.")
+        print("This process has no robot motor access.")
+        engaged_pub.publish(Bool(data=False))
+        gripper_pub.publish(Bool(data=False))
+        rate = rospy.Rate(args.publish_hz)
+
+        while not stop and not rospy.is_shutdown():
+            now_ns = time.monotonic_ns()
+            now = time.monotonic()
+            if keyboard_fd is not None and select.select([sys.stdin], [], [], 0.0)[0]:
+                key = sys.stdin.read(1).lower()
+                if key == "b":
+                    gripper_open = not gripper_open
+                    gripper_pub.publish(Bool(data=gripper_open))
+                    print("\nGripper command: %s" % ("OPEN" if gripper_open else "CLOSED"))
+            pedal = deadman.snapshot()
+            healthy, reason, age_ms, sample = receiver.health(now_ns, args.timeout_ms)
+            if not pedal.device_ok:
+                healthy = False
+                reason = pedal.error or "pedal unavailable"
+
+            if not pedal.held:
+                armed_by_release = True
+                engaged = False
+                anchor_pose = None
+                anchor_quaternion = None
+                scale_anchor_controller = None
+                scale_anchor_command = None
+            elif armed_by_release and healthy and sample is not None and not engaged:
+                anchor_pose = sample.pose()
+                anchor_quaternion = sample.quaternion.copy()
+                scale_anchor_controller = np.zeros(3, dtype=float)
+                scale_anchor_command = np.zeros(3, dtype=float)
+                engaged = True
+                armed_by_release = False
+            elif engaged and not healthy:
+                engaged = False
+                anchor_pose = None
+                anchor_quaternion = None
+                scale_anchor_controller = None
+                scale_anchor_command = None
+                armed_by_release = False
+
+            shift_presses, scale_keyboard_ok, scale_error = scale_reader.snapshot()
+            if shift_presses != handled_shift_presses:
+                press_delta = max(0, shift_presses - handled_shift_presses)
+                if press_delta:
+                    controller_relative = None
+                    current_command = None
+                    if (
+                        engaged
+                        and sample is not None
+                        and anchor_pose is not None
+                        and scale_anchor_controller is not None
+                    ):
+                        current_pose = sample.pose()
+                        world_delta = current_pose.position - anchor_pose.position
+                        controller_relative = anchor_pose.rotation.T.dot(world_delta)
+                        current_command = (
+                            scale_anchor_command
+                            + position_scale
+                            * (controller_relative - scale_anchor_controller)
+                        )
+                    for _index in range(press_delta):
+                        position_scale = 3.0 if position_scale == 1.0 else 1.0
+                    if controller_relative is not None:
+                        scale_anchor_controller = controller_relative
+                        scale_anchor_command = current_command
+                    handled_shift_presses = shift_presses
+                    print(
+                        "\nPosition scale: %.1fx (position re-anchored)"
+                        % position_scale
+                    )
+
+            engaged_pub.publish(Bool(data=engaged))
+            if engaged and sample is not None and anchor_pose is not None:
+                current_pose = sample.pose()
+                world_delta = current_pose.position - anchor_pose.position
+                controller_relative = anchor_pose.rotation.T.dot(world_delta)
+                relative_position = (
+                    scale_anchor_command
+                    + position_scale * (controller_relative - scale_anchor_controller)
+                )
+                relative_quaternion = quaternion_multiply(
+                    quaternion_conjugate(anchor_quaternion), sample.quaternion
+                )
+                if not np.all(np.isfinite(relative_position)):
+                    raise RuntimeError("relative controller position became non-finite")
+                message = PoseStamped()
+                message.header.stamp = rospy.Time.now()
+                message.header.frame_id = "giraf_base_relative"
+                message.pose.position.x = float(relative_position[0])
+                message.pose.position.y = float(relative_position[1])
+                message.pose.position.z = float(relative_position[2])
+                message.pose.orientation.x = float(relative_quaternion[0])
+                message.pose.orientation.y = float(relative_quaternion[1])
+                message.pose.orientation.z = float(relative_quaternion[2])
+                message.pose.orientation.w = float(relative_quaternion[3])
+                pose_pub.publish(message)
+
+            if now - last_status >= 0.25:
+                last_status = now
+                age_text = "n/a" if not math.isfinite(age_ms) else "%.1f" % age_ms
+                status = "engaged=%s pedal=%s scale=%.1fx shift_key=%s gripper=%s stream=%s age=%sms" % (
+                    engaged,
+                    pedal.held,
+                    position_scale,
+                    "ok" if scale_keyboard_ok else (scale_error or "failed"),
+                    "open" if gripper_open else "closed",
+                    reason,
+                    age_text,
+                )
+                status_pub.publish(String(data=status))
+                print("\r" + status + "   ", end="", flush=True)
+            rate.sleep()
+        return 0
+    finally:
+        if keyboard_fd is not None and terminal_settings is not None:
+            termios.tcsetattr(keyboard_fd, termios.TCSADRAIN, terminal_settings)
+        for _index in range(10):
+            engaged_pub.publish(Bool(data=False))
+            time.sleep(0.01)
+        if deadman_started:
+            deadman.stop()
+        if scale_reader_started:
+            scale_reader.stop()
+        if receiver_started:
+            receiver.stop()
+        print("\nFinal operator stopped; engaged=False published.")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
