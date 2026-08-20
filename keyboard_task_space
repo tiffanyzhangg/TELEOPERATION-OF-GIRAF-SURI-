@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""Discrete base-frame Cartesian keyboard jogs for the three MD80 arm motors.
+
+The arm must start at its established home pose because ``motor_connect``
+zeros the MD80 encoders at startup. At startup, Dynamixel wrist IDs 21-23 are
+commanded to their home ticks and gripper ID 24 is commanded closed.
+
+W/S: base-frame +X/-X (forward/back)
+A/D: base-frame +Y/-Y (left/right)
+P/L: base-frame +Z/-Z (up/down)
+U/O: base-frame +Rx/-Rx wrist rotation
+I/K: base-frame +Ry/-Ry wrist rotation
+J/H: base-frame +Rz/-Rz wrist rotation
+Space: latch stop, disable the MD80 motors, and exit
+Q: hold the current target, disable the MD80 motors, and exit
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import select
+import sys
+import termios
+import time
+import traceback
+import tty
+
+import numpy as np
+import rospy
+
+from anymal_custom_control.RRP_kinematic_model import (
+    get_boom_length_d3,
+    get_boom_motor_rad,
+)
+from anymal_custom_control.RRPRRR_kinematic_model import num_jacobian
+from anymal_custom_control.control.giraf_arm_common import (
+    BOOM_MAX,
+    BOOM_MIN,
+    D3_MIN,
+    PITCH_KIN_OFFSET,
+    PITCH_MAX,
+    PITCH_MIN,
+    ROLL_LIMIT,
+    THETA4_DXL_SIGN,
+    THETA4_KIN_OFFSET,
+    THETA5_DXL_SIGN,
+    THETA5_KIN_OFFSET,
+    THETA6_KIN_OFFSET,
+)
+from anymal_custom_control.dynamixel import (
+    ARM_IDS,
+    ARM_HOME,
+    ARM_TICK_LIMITS,
+    GRIPPER_IDS,
+    dynamixel_connect,
+    dynamixel_disconnect,
+    dynamixel_drive,
+    dynamixel_read,
+    radians_to_ticks,
+)
+from anymal_custom_control.motor_driver import (
+    motor_connect,
+    motor_disconnect,
+    motor_drive,
+)
+
+
+JACOBIAN_RCOND = 1e-3
+# Per-key safety caps: roll rad, pitch rad, prismatic extension metres.
+MAX_ARM_STEP = np.array((0.01, 0.01, 0.005), dtype=float)
+
+MAX_WRIST_STEP = np.array((0.02, 0.02, 0.02), dtype=float)
+MAX_FULL_JOINT_STEP = np.concatenate((MAX_ARM_STEP, MAX_WRIST_STEP))
+DEFAULT_DXL_PORT = "/dev/ttyACM2"
+DEFAULT_DXL_BAUD = 1_000_000
+WRIST_HOME_TICKS = {21: 3075, 22: 3075, 23: 2050}
+GRIPPER_CLOSED_TICKS = {24: 3900}
+
+class RawTerminal:
+    def __enter__(self):
+        if not sys.stdin.isatty():
+            raise RuntimeError("An interactive terminal is required")
+        self.fd = sys.stdin.fileno()
+        self.settings = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback_):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.settings)
+
+    @staticmethod
+    def read_key(timeout: float = 0.1) -> str | None:
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not readable:
+            return None
+        return sys.stdin.read(1)
+
+
+def joint_coordinates(
+    roll: float, pitch: float, d3: float, wrist: np.ndarray
+) -> np.ndarray:
+    return np.array(
+        (
+            roll,
+            pitch + PITCH_KIN_OFFSET,
+            d3,
+            wrist[0] + THETA4_KIN_OFFSET,
+            wrist[1] + THETA5_KIN_OFFSET,
+            wrist[2] + THETA6_KIN_OFFSET,
+        ),
+        dtype=float,
+    )
+
+
+def task_step_to_joint_step(
+    roll: float,
+    pitch: float,
+    d3: float,
+    wrist: np.ndarray,
+    task_step: np.ndarray,
+) -> np.ndarray:
+    jacobian = np.asarray(
+        num_jacobian(joint_coordinates(roll, pitch, d3, wrist)), dtype=float
+    )
+    if jacobian.ndim != 2 or jacobian.shape[0] < 3 or jacobian.shape[1] < 3:
+        raise RuntimeError(f"unexpected Jacobian shape: {jacobian.shape}")
+    arm_jacobian = jacobian[:3, :3]
+    if not np.all(np.isfinite(arm_jacobian)):
+        raise RuntimeError("arm Jacobian contains non-finite values")
+
+    joint_step = np.linalg.pinv(arm_jacobian, rcond=JACOBIAN_RCOND).dot(task_step)
+    if not np.all(np.isfinite(joint_step)):
+        raise RuntimeError("arm Jacobian produced a non-finite joint step")
+
+    ratio = float(np.max(np.abs(joint_step) / MAX_ARM_STEP))
+    if ratio > 1.0:
+        joint_step /= ratio
+    return joint_step
+
+
+def wrist_ticks(wrist: np.ndarray) -> list[int]:
+    return [
+        ARM_HOME[ARM_IDS[0]] + radians_to_ticks(THETA4_DXL_SIGN * wrist[0]),
+        ARM_HOME[ARM_IDS[1]] + radians_to_ticks(THETA5_DXL_SIGN * wrist[1]),
+        ARM_HOME[ARM_IDS[2]] + radians_to_ticks(wrist[2]),
+    ]
+
+
+def rotation_step_to_wrist_step(
+    roll: float,
+    pitch: float,
+    d3: float,
+    wrist: np.ndarray,
+    rotation_step: np.ndarray,
+) -> np.ndarray:
+    jacobian = np.asarray(
+        num_jacobian(joint_coordinates(roll, pitch, d3, wrist)), dtype=float
+    )
+    if jacobian.ndim != 2 or jacobian.shape[0] < 6 or jacobian.shape[1] < 6:
+        raise RuntimeError(f"unexpected Jacobian shape: {jacobian.shape}")
+    wrist_jacobian = jacobian[3:6, 3:6]
+    if not np.all(np.isfinite(wrist_jacobian)):
+        raise RuntimeError("wrist Jacobian contains non-finite values")
+
+    wrist_step = np.linalg.pinv(wrist_jacobian, rcond=JACOBIAN_RCOND).dot(rotation_step)
+    if not np.all(np.isfinite(wrist_step)):
+        raise RuntimeError("wrist Jacobian produced a non-finite joint step")
+    ratio = float(np.max(np.abs(wrist_step) / MAX_WRIST_STEP))
+    if ratio > 1.0:
+        wrist_step /= ratio
+    return wrist_step
+
+
+def full_task_step_to_joint_step(
+    roll: float,
+    pitch: float,
+    d3: float,
+    wrist: np.ndarray,
+    task_step: np.ndarray,
+) -> np.ndarray:
+    jacobian = np.asarray(
+        num_jacobian(joint_coordinates(roll, pitch, d3, wrist)), dtype=float
+    )
+    if jacobian.shape != (6, 6) or not np.all(np.isfinite(jacobian)):
+        raise RuntimeError(f"invalid full Jacobian shape or values: {jacobian.shape}")
+    joint_step = np.linalg.pinv(jacobian, rcond=JACOBIAN_RCOND).dot(task_step)
+    minimum_d3 = float(get_boom_length_d3(BOOM_MAX))
+    if d3 <= minimum_d3 + 1e-6 and joint_step[2] < 0.0:
+        if joint_step[2] >= -1e-6:
+            joint_step[2] = 0.0
+        else:
+            free_columns = np.array((0, 1, 3, 4, 5), dtype=int)
+            free_step = np.linalg.pinv(
+                jacobian[:, free_columns], rcond=JACOBIAN_RCOND
+            ).dot(task_step)
+            joint_step = np.zeros(6, dtype=float)
+            joint_step[free_columns] = free_step
+    if not np.all(np.isfinite(joint_step)):
+        raise RuntimeError("full Jacobian produced a non-finite joint step")
+    ratio = float(np.max(np.abs(joint_step) / MAX_FULL_JOINT_STEP))
+    if ratio > 1.0:
+        joint_step /= ratio
+    return joint_step
+
+
+def command_wrist_home_and_closed(dxl_context) -> None:
+    expected_arm_ids = tuple(WRIST_HOME_TICKS)
+    expected_gripper_ids = tuple(GRIPPER_CLOSED_TICKS)
+    if tuple(ARM_IDS) != expected_arm_ids or tuple(GRIPPER_IDS) != expected_gripper_ids:
+        raise RuntimeError(
+            "unexpected Dynamixel configuration: "
+            f"ARM_IDS={tuple(ARM_IDS)}, GRIPPER_IDS={tuple(GRIPPER_IDS)}"
+        )
+
+    state = dynamixel_read(dxl_context)
+    for motor_id in expected_arm_ids + expected_gripper_ids:
+        if motor_id not in state or state[motor_id].get("position") is None:
+            raise RuntimeError(f"no measured position from Dynamixel ID {motor_id}")
+    for motor_id, target in WRIST_HOME_TICKS.items():
+        low, high = ARM_TICK_LIMITS[motor_id]
+        if not low <= target <= high:
+            raise RuntimeError(
+                f"home target {target} for Dynamixel ID {motor_id} "
+                f"is outside [{low}, {high}]"
+            )
+
+    targets = [
+        *(WRIST_HOME_TICKS[motor_id] for motor_id in ARM_IDS),
+        *(GRIPPER_CLOSED_TICKS[motor_id] for motor_id in GRIPPER_IDS),
+    ]
+    if not dynamixel_drive(dxl_context, targets):
+        raise RuntimeError("failed to command wrist home and gripper closed")
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cartesian-step", type=float, default=0.002)
+    parser.add_argument("--angular-step", type=float, default=0.01)
+    parser.add_argument("--full-jacobian", action="store_true")
+    parser.add_argument("--settle-seconds", type=float, default=0.02)
+    parser.add_argument("--dxl-port", default=DEFAULT_DXL_PORT)
+    parser.add_argument("--dxl-baud", type=int, default=DEFAULT_DXL_BAUD)
+    parser.add_argument("--kp", type=float, default=100.0)
+    parser.add_argument("--kd", type=float, default=5.0)
+    parser.add_argument("--max-torque", type=float, default=6.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    values = (
+        args.cartesian_step,
+        args.angular_step,
+        args.settle_seconds,
+        args.kp,
+        args.kd,
+        args.max_torque,
+    )
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        raise ValueError("step, settle time, gains, and torque must be positive")
+    if args.dxl_baud <= 0:
+        raise ValueError("Dynamixel baud rate must be positive")
+
+    rospy.init_node("giraf_arm_keyboard_task_jog", anonymous=False)
+    roll = 0.0
+    pitch = 0.0
+    minimum_d3 = float(get_boom_length_d3(BOOM_MAX))
+    d3 = max(D3_MIN, minimum_d3)
+    boom = float(np.clip(get_boom_motor_rad(d3), BOOM_MIN, BOOM_MAX))
+    d3 = float(get_boom_length_d3(boom))
+    motor_context = None
+    dxl_context = None
+    wrist = np.zeros(3, dtype=float)
+
+    translation_directions = {
+        "w": ("forward +X", np.array((1.0, 0.0, 0.0))),
+        "s": ("back -X", np.array((-1.0, 0.0, 0.0))),
+        "a": ("left +Y", np.array((0.0, 1.0, 0.0))),
+        "d": ("right -Y", np.array((0.0, -1.0, 0.0))),
+        "p": ("up +Z", np.array((0.0, 0.0, 1.0))),
+        "l": ("down -Z", np.array((0.0, 0.0, -1.0))),
+    }
+    rotation_directions = {
+        "u": ("wrist +Rx", np.array((1.0, 0.0, 0.0))),
+        "o": ("wrist -Rx", np.array((-1.0, 0.0, 0.0))),
+        "i": ("wrist +Ry", np.array((0.0, 1.0, 0.0))),
+        "k": ("wrist -Ry", np.array((0.0, -1.0, 0.0))),
+        "j": ("wrist +Rz", np.array((0.0, 0.0, 1.0))),
+        "h": ("wrist -Rz", np.array((0.0, 0.0, -1.0))),
+    }
+
+    print("ARM-ONLY MD80 BASE-FRAME TASK-SPACE KEYBOARD JOG")
+    print("Confirm the three MD80 joints are at their established home pose.")
+    print("Startup wrist: ID21=3075 ID22=3075 ID23=2050 ID24=3900 (closed)")
+    print("W/S: +X/-X | A/D: +Y/-Y | P/L: +Z/-Z")
+    print("U/O: +Rx/-Rx | I/K: +Ry/-Ry | J/H: +Rz/-Rz")
+    print(f"Jacobian mode: {'FULL 6x6' if args.full_jacobian else 'SEPARATE 3x3'}")
+    print("SPACE: latched stop and exit | Q: clean exit")
+
+    try:
+        dxl_context = dynamixel_connect(port=args.dxl_port, baudrate=args.dxl_baud)
+        command_wrist_home_and_closed(dxl_context)
+        print("Dynamixel wrist commanded home; gripper commanded closed.")
+
+        motor_context = motor_connect(
+            kp=args.kp,
+            kd=args.kd,
+            max_torque=args.max_torque,
+            gain_overrides={},
+        )
+        motor_drive(motor_context, roll, pitch, boom)
+        print("MD80 motors enabled at home targets; ready for Cartesian jogs.")
+
+        with RawTerminal() as terminal:
+            while not rospy.is_shutdown():
+                key = terminal.read_key()
+                if key is None:
+                    continue
+                if key == " ":
+                    print("\r\nSTOP LATCHED; disabling MD80 motors.")
+                    return 2
+                if key.lower() == "q":
+                    print("\r\nQuit requested; disabling MD80 motors.")
+                    return 0
+
+                character = key.lower()
+                translation_command = translation_directions.get(character)
+                rotation_command = rotation_directions.get(character)
+                if (
+                    args.full_jacobian
+                    and (
+                        translation_command is not None
+                        or rotation_command is not None
+                    )
+                ):
+                    if translation_command is not None:
+                        action, direction = translation_command
+                        task_step = np.concatenate(
+                            (args.cartesian_step * direction, np.zeros(3))
+                        )
+                    else:
+                        action, direction = rotation_command
+                        task_step = np.concatenate(
+                            (np.zeros(3), args.angular_step * direction)
+                        )
+                    joint_step = full_task_step_to_joint_step(
+                        roll, pitch, d3, wrist, task_step
+                    )
+                    current_jacobian = np.asarray(
+                        num_jacobian(joint_coordinates(roll, pitch, d3, wrist)),
+                        dtype=float,
+                    )
+                    achieved_step = current_jacobian.dot(joint_step)
+                    achieved_norm = float(np.linalg.norm(achieved_step))
+                    task_norm = float(np.linalg.norm(task_step))
+                    alignment = float(achieved_step.dot(task_step)) / max(
+                        achieved_norm * task_norm, 1e-12
+                    )
+                    if achieved_norm <= 1e-9 or alignment < 0.75:
+                        print(f"\r\n{action} unavailable at current joint limit")
+                        continue
+                    proposed_roll = roll + float(joint_step[0])
+                    proposed_pitch = pitch + float(joint_step[1])
+                    proposed_d3 = d3 + float(joint_step[2])
+                    if not (
+                        -ROLL_LIMIT <= proposed_roll <= ROLL_LIMIT
+                        and PITCH_MIN <= proposed_pitch <= PITCH_MAX
+                        and proposed_d3 >= D3_MIN
+                    ):
+                        print(f"\r\n{action} ignored: arm joint limit reached")
+                        continue
+                    proposed_boom = float(get_boom_motor_rad(proposed_d3))
+                    if not BOOM_MIN <= proposed_boom <= BOOM_MAX:
+                        print(f"\r\n{action} ignored: boom limit reached")
+                        continue
+                    proposed_wrist = wrist + joint_step[3:6]
+                    proposed_ticks = wrist_ticks(proposed_wrist)
+                    wrist_within_limits = all(
+                        ARM_TICK_LIMITS[motor_id][0]
+                        <= tick
+                        <= ARM_TICK_LIMITS[motor_id][1]
+                        for motor_id, tick in zip(ARM_IDS, proposed_ticks)
+                    )
+                    if not wrist_within_limits:
+                        print(f"\r\n{action} ignored: wrist tick limit reached")
+                        continue
+                    roll = proposed_roll
+                    pitch = proposed_pitch
+                    boom = proposed_boom
+                    d3 = float(get_boom_length_d3(boom))
+                    wrist = proposed_wrist
+                    motor_drive(motor_context, roll, pitch, boom)
+                    targets = proposed_ticks + [GRIPPER_CLOSED_TICKS[GRIPPER_IDS[0]]]
+                    if not dynamixel_drive(dxl_context, targets):
+                        raise RuntimeError("Dynamixel command transmission failed")
+                    print(
+                        f"\r\n{action} full-6x6: qstep="
+                        f"{np.array2string(joint_step, precision=4)}"
+                    )
+                    time.sleep(args.settle_seconds)
+                    continue
+
+                rotation_command = rotation_directions.get(character)
+                if rotation_command is not None:
+                    action, direction = rotation_command
+                    rotation_step = args.angular_step * direction
+                    proposed_wrist = wrist + rotation_step_to_wrist_step(
+                        roll, pitch, d3, wrist, rotation_step
+                    )
+                    proposed_ticks = wrist_ticks(proposed_wrist)
+                    within_limits = all(
+                        ARM_TICK_LIMITS[motor_id][0]
+                        <= tick
+                        <= ARM_TICK_LIMITS[motor_id][1]
+                        for motor_id, tick in zip(ARM_IDS, proposed_ticks)
+                    )
+                    if not within_limits:
+                        print(f"\r\n{action} ignored: wrist tick limit reached")
+                        continue
+                    wrist = proposed_wrist
+                    targets = proposed_ticks + [GRIPPER_CLOSED_TICKS[GRIPPER_IDS[0]]]
+                    if not dynamixel_drive(dxl_context, targets):
+                        raise RuntimeError("Dynamixel command transmission failed")
+                    print(
+                        f"\r\n{action}: wrist={np.array2string(wrist, precision=3)} "
+                        f"ticks={proposed_ticks}"
+                    )
+                    time.sleep(args.settle_seconds)
+                    continue
+
+                command = translation_directions.get(key.lower())
+                if command is None:
+                    continue
+                action, direction = command
+                task_step = args.cartesian_step * direction
+                joint_step = task_step_to_joint_step(roll, pitch, d3, wrist, task_step)
+
+                roll = float(np.clip(roll + joint_step[0], -ROLL_LIMIT, ROLL_LIMIT))
+                pitch = float(
+                    np.clip(pitch + joint_step[1], PITCH_MIN, PITCH_MAX)
+                )
+                proposed_d3 = max(D3_MIN, d3 + float(joint_step[2]))
+                boom = float(
+                    np.clip(get_boom_motor_rad(proposed_d3), BOOM_MIN, BOOM_MAX)
+                )
+                d3 = float(get_boom_length_d3(boom))
+
+                motor_drive(motor_context, roll, pitch, boom)
+                print(
+                    f"\r\n{action}: roll={roll:+.3f}, pitch={pitch:+.3f}, "
+                    f"d3={d3:+.4f} m, boom={boom:+.3f} rad"
+                )
+                time.sleep(args.settle_seconds)
+        return 0
+    except rospy.ROSInterruptException:
+        return 0
+    except Exception as exc:
+        print(f"\r\nFATAL: {exc}")
+        traceback.print_exc()
+        return 1
+    finally:
+        if motor_context is not None:
+            try:
+                motor_drive(motor_context, roll, pitch, boom)
+                time.sleep(0.02)
+            finally:
+                if not motor_disconnect():
+                    print("WARNING: not every MD80 acknowledged disable", file=sys.stderr)
+        if dxl_context is not None:
+            dynamixel_disconnect(dxl_context)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
